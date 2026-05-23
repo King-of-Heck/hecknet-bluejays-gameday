@@ -33,8 +33,9 @@ PAPER_PX    = int(PAPER_MM / 25.4 * PRINTER_DPI)   # ≈ 638 px
 MARGIN_PX   = 10
 TEXT_PX     = PAPER_PX - 2 * MARGIN_PX
 
-POLL_INTERVAL = 15   # seconds between live-feed polls during a game
-IDLE_INTERVAL = 60   # seconds between schedule checks when no game is live
+POLL_INTERVAL    = 15    # seconds between live-feed polls during a game
+IDLE_INTERVAL    = 60    # seconds between schedule checks when no game is live
+HR_STAT_TIMEOUT  = 120   # seconds to wait for Statcast hitData before printing anyway
 
 BLUE_JAYS_TEAM_ID = 141
 
@@ -495,9 +496,12 @@ def monitor():
             time.sleep(IDLE_INTERVAL * 10)
             continue
 
-        printed_start     = False
-        printed_end       = False
-        seen_hr_play_ids  : set[str] = set()
+        printed_start = False
+        printed_end   = False
+        done_play_ids: set[str] = set()
+        # Plays detected as Jays HRs but waiting for Statcast data.
+        # key: play_id    value: dict with snapshot data + first_seen timestamp
+        pending_hrs: dict[str, dict] = {}
 
         print(f"[{ts()}] Entering game monitor loop for game {game_pk}…")
 
@@ -543,55 +547,88 @@ def monitor():
                                  .get("allPlays", []))
                 jays_side = _jays_side(live)
 
+                play_by_id: dict[str, dict] = {}
                 for play in all_plays:
-                    result = play.get("result", {})
-                    about  = play.get("about", {})
+                    about   = play.get("about", {})
+                    result  = play.get("result", {})
+                    play_id = str(about.get("atBatIndex", "")
+                                  or result.get("description", "")[:40])
+                    play_by_id[play_id] = play
 
-                    play_id = about.get("atBatIndex", "") or result.get("description", "")[:40]
-                    play_id = str(play_id)
-
-                    if play_id in seen_hr_play_ids:
+                for play_id, play in play_by_id.items():
+                    if play_id in done_play_ids or play_id in pending_hrs:
                         continue
 
-                    event_type = result.get("eventType", "")
+                    result      = play.get("result", {})
+                    about       = play.get("about", {})
+                    event_type  = result.get("eventType", "")
                     if event_type != "home_run":
                         continue
 
-                    half_inning = about.get("halfInning", "")
+                    half_inning    = about.get("halfInning", "")
                     batter_is_jays = (
                         (jays_side == "away" and half_inning == "top") or
                         (jays_side == "home" and half_inning == "bottom")
                     )
                     if not batter_is_jays:
-                        seen_hr_play_ids.add(play_id)
+                        done_play_ids.add(play_id)
                         continue
-
-                    seen_hr_play_ids.add(play_id)
-
-                    hit_data   = play.get("hitData", {})
-                    exit_velo  = hit_data.get("launchSpeed")
-                    launch_ang = hit_data.get("launchAngle")
-                    distance   = hit_data.get("totalDistance")
 
                     matchup     = play.get("matchup", {})
                     batter_name = matchup.get("batter", {}).get("fullName", "Unknown")
-
-                    hr_inning = about.get("inning", inning)
-                    hr_half   = half_inning or half
-
-                    hr_jays  = result.get("homeScore") if jays_side == "home" else result.get("awayScore")
-                    hr_opp   = result.get("awayScore") if jays_side == "home" else result.get("homeScore")
+                    hr_inning   = about.get("inning", inning)
+                    hr_half     = half_inning or half
+                    hr_jays     = result.get("homeScore") if jays_side == "home" else result.get("awayScore")
+                    hr_opp      = result.get("awayScore") if jays_side == "home" else result.get("homeScore")
                     if hr_jays is None:
                         hr_jays = jays_score
                     if hr_opp is None:
                         hr_opp = opp_score
 
-                    print(f"[{ts()}]  HOME RUN — {batter_name} "
+                    pending_hrs[play_id] = {
+                        "batter_name": batter_name,
+                        "hr_inning":   hr_inning,
+                        "hr_half":     hr_half,
+                        "hr_jays":     hr_jays,
+                        "hr_opp":      hr_opp,
+                        "opp":         opp,
+                        "first_seen":  time.monotonic(),
+                    }
+                    print(f"[{ts()}]  HR detected — {batter_name} (waiting for Statcast…)")
+
+                for play_id in list(pending_hrs.keys()):
+                    info = pending_hrs[play_id]
+
+                    play      = play_by_id.get(play_id, {})
+                    hit_data  = play.get("hitData", {})
+                    exit_velo = hit_data.get("launchSpeed")
+                    launch_ang = hit_data.get("launchAngle")
+                    distance  = hit_data.get("totalDistance")
+
+                    all_present = (exit_velo is not None
+                                   and launch_ang is not None
+                                   and distance is not None)
+                    timed_out   = (time.monotonic() - info["first_seen"]
+                                   >= HR_STAT_TIMEOUT)
+
+                    if not all_present and not timed_out:
+                        print(f"[{ts()}]   ⏳ Still waiting for Statcast on {info['batter_name']}…")
+                        continue
+
+                    done_play_ids.add(play_id)
+                    del pending_hrs[play_id]
+
+                    if timed_out and not all_present:
+                        print(f"[{ts()}]     Statcast timeout for {info['batter_name']} — printing without metrics.")
+
+                    print(f"[{ts()}]   Printing HR receipt — {info['batter_name']} "
                           f"EV={exit_velo}  LA={launch_ang}  Dist={distance}")
                     try:
-                        img = build_home_run(batter_name, launch_ang, exit_velo,
-                                             distance, hr_jays, hr_opp, opp,
-                                             hr_inning, hr_half)
+                        img = build_home_run(
+                            info["batter_name"], launch_ang, exit_velo, distance,
+                            info["hr_jays"], info["hr_opp"], info["opp"],
+                            info["hr_inning"], info["hr_half"],
+                        )
                         send_to_printer(img)
                         print(f"[{ts()}]  Home Run receipt printed.")
                     except Exception as e:
