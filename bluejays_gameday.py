@@ -86,6 +86,65 @@ def get_player_stats(player_id: int, group: str, season: int) -> dict:
     return {}
 
 
+SAVANT_BASE = "https://baseballsavant.mlb.com"
+SAVANT_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/124.0.0.0 Safari/537.36"),
+    "Referer": "https://baseballsavant.mlb.com/gamefeed",
+}
+
+
+def fetch_savant_homers(game_pk: int) -> list[dict]:
+    """
+    Query Baseball Savant's statcast_search CSV for all home runs in game_pk.
+    Returns a list of dicts with keys: player_id (int), player_name,
+    launch_speed, launch_angle, hit_distance_sc.
+    Returns [] on any error.
+    """
+    import csv, io
+    params = {
+        "all":           "true",
+        "game_pk":       game_pk,
+        "type":          "details",
+        "player_type":   "batter",
+        "events":        "home_run",
+        "csv":           "true",
+    }
+    try:
+        r = requests.get(
+            f"{SAVANT_BASE}/statcast_search/csv",
+            params=params,
+            headers=SAVANT_HEADERS,
+            timeout=15,
+        )
+        r.raise_for_status()
+        text = r.text.strip()
+        if not text or text.startswith("Error") or "<html" in text.lower():
+            return []
+        reader = csv.DictReader(io.StringIO(text))
+        rows = []
+        for row in reader:
+            try:
+                pid = int(row.get("batter", 0))
+            except (ValueError, TypeError):
+                pid = 0
+            def _f(key):
+                v = row.get(key, "").strip()
+                return float(v) if v else None
+            rows.append({
+                "player_id":      pid,
+                "player_name":    row.get("player_name", "").strip(),
+                "launch_speed":   _f("launch_speed"),
+                "launch_angle":   _f("launch_angle"),
+                "hit_distance_sc": _f("hit_distance_sc"),
+            })
+        return rows
+    except Exception as e:
+        print(f"[{ts()}]   [Savant] fetch error: {e}")
+        return []
+
+
 def load_font(bold=False, size=None):
     size = size or FONT_SIZE
     path = FONT_BOLD if bold else FONT_PATH
@@ -575,7 +634,9 @@ def monitor():
                         continue
 
                     matchup     = play.get("matchup", {})
-                    batter_name = matchup.get("batter", {}).get("fullName", "Unknown")
+                    batter_obj  = matchup.get("batter", {})
+                    batter_name = batter_obj.get("fullName", "Unknown")
+                    batter_id   = batter_obj.get("id", 0)
                     hr_inning   = about.get("inning", inning)
                     hr_half     = half_inning or half
                     hr_jays     = result.get("homeScore") if jays_side == "home" else result.get("awayScore")
@@ -587,6 +648,7 @@ def monitor():
 
                     pending_hrs[play_id] = {
                         "batter_name": batter_name,
+                        "batter_id":   batter_id,
                         "hr_inning":   hr_inning,
                         "hr_half":     hr_half,
                         "hr_jays":     hr_jays,
@@ -594,32 +656,43 @@ def monitor():
                         "opp":         opp,
                         "first_seen":  time.monotonic(),
                     }
-                    print(f"[{ts()}]  HR detected — {batter_name} (waiting for Statcast…)")
+                    print(f"[{ts()}]  HR detected — {batter_name} (querying Savant for Statcast…)")
+
+                if pending_hrs:
+                    savant_rows = fetch_savant_homers(game_pk)
+                    savant_by_pid: dict[int, dict] = {}
+                    for row in savant_rows:
+                        pid = row["player_id"]
+                        ev  = row["launch_speed"]
+                        la  = row["launch_angle"]
+                        dist = row["hit_distance_sc"]
+                        if ev is not None and la is not None and dist is not None:
+                            savant_by_pid[pid] = row
 
                 for play_id in list(pending_hrs.keys()):
                     info = pending_hrs[play_id]
 
-                    play      = play_by_id.get(play_id, {})
-                    hit_data  = play.get("hitData", {})
-                    exit_velo = hit_data.get("launchSpeed")
-                    launch_ang = hit_data.get("launchAngle")
-                    distance  = hit_data.get("totalDistance")
+                    savant = savant_by_pid.get(info["batter_id"])
+                    if savant:
+                        exit_velo  = savant["launch_speed"]
+                        launch_ang = savant["launch_angle"]
+                        distance   = savant["hit_distance_sc"]
+                        all_present = True
+                    else:
+                        exit_velo = launch_ang = distance = None
+                        all_present = False
 
-                    all_present = (exit_velo is not None
-                                   and launch_ang is not None
-                                   and distance is not None)
-                    timed_out   = (time.monotonic() - info["first_seen"]
-                                   >= HR_STAT_TIMEOUT)
+                    timed_out = (time.monotonic() - info["first_seen"] >= HR_STAT_TIMEOUT)
 
                     if not all_present and not timed_out:
-                        print(f"[{ts()}]   ⏳ Still waiting for Statcast on {info['batter_name']}…")
+                        print(f"[{ts()}]   ⏳ Savant metrics not yet available for {info['batter_name']}…")
                         continue
 
                     done_play_ids.add(play_id)
                     del pending_hrs[play_id]
 
                     if timed_out and not all_present:
-                        print(f"[{ts()}]     Statcast timeout for {info['batter_name']} — printing without metrics.")
+                        print(f"[{ts()}]     Savant timeout for {info['batter_name']} — printing without metrics.")
 
                     print(f"[{ts()}]   Printing HR receipt — {info['batter_name']} "
                           f"EV={exit_velo}  LA={launch_ang}  Dist={distance}")
