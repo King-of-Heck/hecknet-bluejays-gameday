@@ -1,5 +1,5 @@
 """
-BlueJays_GameDay_1_0.py
+BlueJays_GameDay_1_4.py
 Monitors live Toronto Blue Jays games via the MLB Stats API (GUMBO feed)
 and prints thermal receipts for three events:
 
@@ -582,7 +582,9 @@ def monitor():
             print(f"Score TOR {jays_score}–{opp_score} {opp}  Inn={half} {inning}")
 
             if not printed_start and abstract == "Live":
-                print(f"[{ts()}] Game started — building lineup receipt…")
+                mid_game = inning > 1 or (inning == 1 and half == "bottom")
+                label = f"Inn {inning} ({half})" if mid_game else "first pitch"
+                print(f"[{ts()}] Game is live ({label}) — building lineup receipt…")
                 try:
                     lineup, pitcher = build_lineup_data(live)
                     g_time = (live.get("gameData", {})
@@ -597,8 +599,7 @@ def monitor():
                     printed_start = True
                     print(f"[{ts()}]  Play Ball receipt printed.")
                 except Exception as e:
-                    print(f"[{ts()}]  Play Ball print error: {e}")
-                    printed_start = True   # don't retry endlessly
+                    print(f"[{ts()}]   Play Ball print failed, will retry: {e}")
 
             if abstract == "Live":
                 all_plays = (live.get("liveData", {})
@@ -658,54 +659,62 @@ def monitor():
                     }
                     print(f"[{ts()}]  HR detected — {batter_name} (querying Savant for Statcast…)")
 
+
                 if pending_hrs:
                     savant_rows = fetch_savant_homers(game_pk)
                     savant_by_pid: dict[int, dict] = {}
                     for row in savant_rows:
-                        pid = row["player_id"]
-                        ev  = row["launch_speed"]
-                        la  = row["launch_angle"]
+                        pid  = row["player_id"]
+                        ev   = row["launch_speed"]
+                        la   = row["launch_angle"]
                         dist = row["hit_distance_sc"]
+                        print(f"[{ts()}]   [Savant] pid={pid} name={row['player_name']!r} "
+                              f"EV={ev} LA={la} Dist={dist}")
                         if ev is not None and la is not None and dist is not None:
                             savant_by_pid[pid] = row
 
-                for play_id in list(pending_hrs.keys()):
-                    info = pending_hrs[play_id]
+                    if not savant_rows:
+                        print(f"[{ts()}]   [Savant] No rows returned yet.")
 
-                    savant = savant_by_pid.get(info["batter_id"])
-                    if savant:
-                        exit_velo  = savant["launch_speed"]
-                        launch_ang = savant["launch_angle"]
-                        distance   = savant["hit_distance_sc"]
-                        all_present = True
-                    else:
-                        exit_velo = launch_ang = distance = None
-                        all_present = False
+                    for play_id in list(pending_hrs.keys()):
+                        info = pending_hrs[play_id]
 
-                    timed_out = (time.monotonic() - info["first_seen"] >= HR_STAT_TIMEOUT)
+                        savant = savant_by_pid.get(info["batter_id"])
+                        if savant:
+                            exit_velo  = savant["launch_speed"]
+                            launch_ang = savant["launch_angle"]
+                            distance   = savant["hit_distance_sc"]
+                            all_present = True
+                        else:
+                            exit_velo = launch_ang = distance = None
+                            all_present = False
 
-                    if not all_present and not timed_out:
-                        print(f"[{ts()}]   ⏳ Savant metrics not yet available for {info['batter_name']}…")
-                        continue
+                        timed_out = (time.monotonic() - info["first_seen"] >= HR_STAT_TIMEOUT)
 
-                    done_play_ids.add(play_id)
-                    del pending_hrs[play_id]
+                        if not all_present and not timed_out:
+                            print(f"[{ts()}]   ⏳ Savant metrics not yet available for "
+                                  f"{info['batter_name']} (id={info['batter_id']})…")
+                            continue
 
-                    if timed_out and not all_present:
-                        print(f"[{ts()}]     Savant timeout for {info['batter_name']} — printing without metrics.")
+                        done_play_ids.add(play_id)
+                        del pending_hrs[play_id]
 
-                    print(f"[{ts()}]   Printing HR receipt — {info['batter_name']} "
-                          f"EV={exit_velo}  LA={launch_ang}  Dist={distance}")
-                    try:
-                        img = build_home_run(
-                            info["batter_name"], launch_ang, exit_velo, distance,
-                            info["hr_jays"], info["hr_opp"], info["opp"],
-                            info["hr_inning"], info["hr_half"],
-                        )
-                        send_to_printer(img)
-                        print(f"[{ts()}]  Home Run receipt printed.")
-                    except Exception as e:
-                        print(f"[{ts()}]  Home Run print error: {e}")
+                        if timed_out and not all_present:
+                            print(f"[{ts()}]     Savant timeout for {info['batter_name']} "
+                                  f"— printing without metrics.")
+
+                        print(f"[{ts()}]   Printing HR receipt — {info['batter_name']} "
+                              f"EV={exit_velo}  LA={launch_ang}  Dist={distance}")
+                        try:
+                            img = build_home_run(
+                                info["batter_name"], launch_ang, exit_velo, distance,
+                                info["hr_jays"], info["hr_opp"], info["opp"],
+                                info["hr_inning"], info["hr_half"],
+                            )
+                            send_to_printer(img)
+                            print(f"[{ts()}]  Home Run receipt printed.")
+                        except Exception as e:
+                            print(f"[{ts()}]  Home Run print error: {e}")
 
             if not printed_end and abstract == "Final":
                 print(f"[{ts()}] Game over — printing result receipt…")
@@ -723,8 +732,26 @@ def monitor():
                 break   # exit inner loop; outer loop will find no game / sleep
 
             if abstract == "Preview":
-                print(f"[{ts()}] Game not yet started. Checking in {IDLE_INTERVAL}s…")
-                time.sleep(IDLE_INTERVAL)
+                # Within 10 min of scheduled first pitch, poll at POLL_INTERVAL
+                # so we don't miss the Live flip even if the API was briefly down.
+                sched_iso = (live.get("gameData", {})
+                                 .get("datetime", {})
+                                 .get("dateTime", ""))
+                near_start = False
+                if sched_iso:
+                    try:
+                        import re as _re2
+                        from datetime import timezone
+                        sched_dt   = datetime.fromisoformat(
+                            _re2.sub(r"Z$", "+00:00", sched_iso))
+                        mins_until = (sched_dt - datetime.now(timezone.utc)).total_seconds() / 60
+                        near_start = mins_until <= 10
+                    except Exception:
+                        pass
+                sleep_s = POLL_INTERVAL if near_start else IDLE_INTERVAL
+                suffix  = " (near start — polling fast)" if near_start else ""
+                print(f"[{ts()}] Game not yet started. Checking in {sleep_s}s{suffix}…")
+                time.sleep(sleep_s)
             else:
                 time.sleep(POLL_INTERVAL)
 
