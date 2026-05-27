@@ -550,7 +550,21 @@ def _current_inning(live: dict) -> tuple[int, str]:
     return ls.get("currentInning", 0), ls.get("inningHalf", "top").lower()
 
 
+def _scheduled_start_utc(game: dict):
+    import re as _re3
+    from datetime import timezone
+    iso = game.get("gameDate", "")
+    if not iso:
+        return None
+    try:
+        return datetime.fromisoformat(_re3.sub(r"Z$", "+00:00", iso))
+    except Exception:
+        return None
+
+
 def monitor():
+    from datetime import timezone
+
     print(f"[{ts()}] HeckNet GameDay starting — monitoring Blue Jays (team {BLUE_JAYS_TEAM_ID})")
 
     while True:
@@ -561,25 +575,48 @@ def monitor():
             print(f"[{ts()}] Schedule fetch error: {e}")
 
         if not game:
-            print(f"[{ts()}] No Blue Jays game today. Checking again in {IDLE_INTERVAL}s…")
-            time.sleep(IDLE_INTERVAL)
+            now      = datetime.now()
+            tomorrow = (now + timedelta(days=1)).replace(
+                           hour=0, minute=5, second=0, microsecond=0)
+            sleep_s  = max(60, (tomorrow - now).total_seconds())
+            print(f"[{ts()}] No Blue Jays game today. Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
+            time.sleep(sleep_s)
             continue
 
-        game_pk   = game["gamePk"]
-        state     = game.get("status", {}).get("abstractGameState", "")
+        game_pk = game["gamePk"]
+        state   = game.get("status", {}).get("abstractGameState", "")
         print(f"[{ts()}] Game found: pk={game_pk}, state={state}")
 
         if state == "Final":
-            print(f"[{ts()}] Game already final. Nothing to monitor today.")
-            time.sleep(IDLE_INTERVAL * 10)
+            now      = datetime.now()
+            tomorrow = (now + timedelta(days=1)).replace(
+                           hour=0, minute=5, second=0, microsecond=0)
+            sleep_s  = max(60, (tomorrow - now).total_seconds())
+            print(f"[{ts()}] Game already final. Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
+            time.sleep(sleep_s)
             continue
+
+        if state == "Preview":
+            sched_utc = _scheduled_start_utc(game)
+            if sched_utc:
+                wake_utc  = sched_utc - timedelta(minutes=10)
+                now_utc   = datetime.now(timezone.utc)
+                sleep_s   = (wake_utc - now_utc).total_seconds()
+                if sleep_s > 60:
+                    wake_local  = wake_utc.astimezone().strftime("%I:%M %p")
+                    pitch_local = sched_utc.astimezone().strftime("%I:%M %p")
+                    print(f"[{ts()}] First pitch at {pitch_local} local. "
+                          f"Sleeping until {wake_local} (T-10 min)…")
+                    time.sleep(sleep_s)
+                else:
+                    print(f"[{ts()}] Within 10 min of first pitch — starting poll loop now.")
+            else:
+                print(f"[{ts()}] Could not parse start time; starting poll loop immediately.")
 
         printed_start = False
         printed_end   = False
         done_play_ids: set[str] = set()
-        # Plays detected as Jays HRs but waiting for Statcast data.
-        # key: play_id    value: dict with snapshot data + first_seen timestamp
-        pending_hrs: dict[str, dict] = {}
+        pending_hrs:   dict[str, dict] = {}
 
         print(f"[{ts()}] Entering game monitor loop for game {game_pk}…")
 
@@ -750,31 +787,18 @@ def monitor():
                 print(f"[{ts()}] Game complete. Resuming idle watch.")
                 break   # exit inner loop; outer loop will find no game / sleep
 
+            # Back off if still pre-game
+            # (Shouldn't normally happen — we slept until T-10 before entering
             if abstract == "Preview":
-                # Within 10 min of scheduled first pitch, poll at POLL_INTERVAL
-                # so we don't miss the Live flip even if the API was briefly down.
-                sched_iso = (live.get("gameData", {})
-                                 .get("datetime", {})
-                                 .get("dateTime", ""))
-                near_start = False
-                if sched_iso:
-                    try:
-                        import re as _re2
-                        from datetime import timezone
-                        sched_dt   = datetime.fromisoformat(
-                            _re2.sub(r"Z$", "+00:00", sched_iso))
-                        mins_until = (sched_dt - datetime.now(timezone.utc)).total_seconds() / 60
-                        near_start = mins_until <= 10
-                    except Exception:
-                        pass
-                sleep_s = POLL_INTERVAL if near_start else IDLE_INTERVAL
-                suffix  = " (near start — polling fast)" if near_start else ""
-                print(f"[{ts()}] Game not yet started. Checking in {sleep_s}s{suffix}…")
-                time.sleep(sleep_s)
-            else:
-                time.sleep(POLL_INTERVAL)
+                print(f"[{ts()}] Still pre-game — checking in {POLL_INTERVAL}s…")
+            time.sleep(POLL_INTERVAL)
 
-        time.sleep(IDLE_INTERVAL * 5)
+        now      = datetime.now()
+        tomorrow = (now + timedelta(days=1)).replace(
+                       hour=0, minute=5, second=0, microsecond=0)
+        sleep_s  = max(60, (tomorrow - now).total_seconds())
+        print(f"[{ts()}] Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
+        time.sleep(sleep_s)
 
 
 if __name__ == "__main__":
