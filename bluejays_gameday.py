@@ -35,7 +35,7 @@ TEXT_PX     = PAPER_PX - 2 * MARGIN_PX
 
 POLL_INTERVAL    = 15    # seconds between live-feed polls during a game
 IDLE_INTERVAL    = 60    # seconds between schedule checks when no game is live
-HR_STAT_TIMEOUT  = 120   # seconds to wait for Statcast hitData before printing anyway
+HR_STAT_TIMEOUT  = 600   # seconds to wait for Statcast hitData before printing anyway
 
 BLUE_JAYS_TEAM_ID = 141
 
@@ -108,12 +108,14 @@ def fetch_savant_homers(game_pk: int) -> list[dict]:
         launch_speed (float|None), launch_angle (float|None),
         hit_distance_sc (float|None)
 
-    The gamefeed JSON has a top-level structure like:
-        { "team_home": [...pitches...], "team_away": [...pitches...] }
-    Each pitch entry for a batted ball has:
-        pitch["events"] == "home_run"
-        pitch["batter"]  → MLBAM player id
-        pitch["hit_speed"], pitch["hit_angle"], pitch["hit_distance"]
+    The gamefeed JSON has a top-level "exit_velocity" array containing one
+    entry per batted ball (in any state — outs, hits, HRs). Fields are:
+        batter        — MLBAM player id (int or string)
+        batter_name   — display name
+        result        — "Home Run", "Single", "Flyout", etc.
+        hit_speed     — exit velocity (mph, string)
+        hit_angle     — launch angle (degrees, string)
+        hit_distance  — distance (feet, string)
     """
     try:
         r = requests.get(
@@ -134,30 +136,31 @@ def fetch_savant_homers(game_pk: int) -> list[dict]:
         except (ValueError, TypeError):
             return None
 
+    ev_list = data.get("exit_velocity", []) or []
+    print(f"[{ts()}]   [Savant/gf] exit_velocity has {len(ev_list)} batted balls total")
+
     rows = []
-    # Savant /gf splits pitches by which team is batting:
-    # "team_home" = pitches faced by the home team's batters
-    for side_key in ("team_home", "team_away"):
-        for pitch in data.get(side_key, []):
-            if pitch.get("events") != "home_run":
-                continue
-            try:
-                pid = int(pitch.get("batter", 0))
-            except (ValueError, TypeError):
-                pid = 0
-            ev   = _f(pitch.get("hit_speed"))
-            la   = _f(pitch.get("hit_angle"))
-            dist = _f(pitch.get("hit_distance"))
-            print(f"[{ts()}]   [Savant/gf] HR row: pid={pid} "
-                  f"name={pitch.get('batter_name','?')!r} "
-                  f"EV={ev} LA={la} Dist={dist}")
-            rows.append({
-                "player_id":       pid,
-                "player_name":     pitch.get("batter_name", ""),
-                "launch_speed":    ev,
-                "launch_angle":    la,
-                "hit_distance_sc": dist,
-            })
+    for bb in ev_list:
+        result = (bb.get("result") or "").strip().lower()
+        if "home run" not in result:
+            continue
+        try:
+            pid = int(bb.get("batter", 0))
+        except (ValueError, TypeError):
+            pid = 0
+        ev   = _f(bb.get("hit_speed"))
+        la   = _f(bb.get("hit_angle"))
+        dist = _f(bb.get("hit_distance"))
+        print(f"[{ts()}]   [Savant/gf] HR row: pid={pid} "
+              f"name={bb.get('batter_name','?')!r} "
+              f"EV={ev} LA={la} Dist={dist}")
+        rows.append({
+            "player_id":       pid,
+            "player_name":     bb.get("batter_name", ""),
+            "launch_speed":    ev,
+            "launch_angle":    la,
+            "hit_distance_sc": dist,
+        })
     return rows
 
 
