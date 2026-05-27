@@ -596,20 +596,56 @@ def monitor():
             time.sleep(sleep_s)
             continue
 
+        # Sleep until 10 minutes before first pitch
+        # We sleep in 1-hour chunks so we re-check the schedule each hour.
         if state == "Preview":
             sched_utc = _scheduled_start_utc(game)
             if sched_utc:
-                wake_utc  = sched_utc - timedelta(minutes=10)
-                now_utc   = datetime.now(timezone.utc)
-                sleep_s   = (wake_utc - now_utc).total_seconds()
-                if sleep_s > 60:
-                    wake_local  = wake_utc.astimezone().strftime("%I:%M %p")
+                while True:
+                    now_utc   = datetime.now(timezone.utc)
+                    wake_utc  = sched_utc - timedelta(minutes=10)
+                    sleep_s   = (wake_utc - now_utc).total_seconds()
+                    if sleep_s <= 60:
+                        print(f"[{ts()}] Within 10 min of first pitch — starting poll loop now.")
+                        break
+                    # Re-check the schedule before sleeping again; the game
+                    # may have been postponed or its start time changed.
+                    try:
+                        fresh = find_todays_jays_game()
+                    except Exception as e:
+                        print(f"[{ts()}] Schedule re-check error: {e}")
+                        fresh = game   # keep existing info on error
+                    if not fresh:
+                        print(f"[{ts()}] Game no longer on today's schedule (postponed?). "
+                              f"Returning to outer loop.")
+                        game = None
+                        break
+                    fresh_pk    = fresh["gamePk"]
+                    fresh_state = fresh.get("status", {}).get("abstractGameState", "")
+                    if fresh_pk != game_pk:
+                        print(f"[{ts()}] Game PK changed ({game_pk}  {fresh_pk}). "
+                              f"Returning to outer loop.")
+                        game = None
+                        break
+                    if fresh_state == "Final":
+                        print(f"[{ts()}] Game marked Final before it started "
+                              f"(likely postponed/cancelled). Returning to outer loop.")
+                        game = None
+                        break
+                    new_sched = _scheduled_start_utc(fresh)
+                    if new_sched and new_sched != sched_utc:
+                        print(f"[{ts()}] Start time changed: "
+                              f"{sched_utc.astimezone().strftime('%I:%M %p')} → "
+                              f"{new_sched.astimezone().strftime('%I:%M %p')} local.")
+                        sched_utc = new_sched
+                    chunk = min(3600, sleep_s)   # sleep at most 1 hour at a time
                     pitch_local = sched_utc.astimezone().strftime("%I:%M %p")
-                    print(f"[{ts()}] First pitch at {pitch_local} local. "
-                          f"Sleeping until {wake_local} (T-10 min)…")
-                    time.sleep(sleep_s)
-                else:
-                    print(f"[{ts()}] Within 10 min of first pitch — starting poll loop now.")
+                    wake_local  = (sched_utc - timedelta(minutes=10)).astimezone().strftime("%I:%M %p")
+                    print(f"[{ts()}] First pitch at {pitch_local} local "
+                          f"(T-{sleep_s/60:.0f} min). Re-checking in {chunk/60:.0f} min…")
+                    time.sleep(chunk)
+                if game is None:
+                    continue   # back to top of outer while True
             else:
                 print(f"[{ts()}] Could not parse start time; starting poll loop immediately.")
 
