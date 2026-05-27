@@ -86,6 +86,9 @@ def get_player_stats(player_id: int, group: str, season: int) -> dict:
     return {}
 
 
+# Baseball Savant live gamefeed — home run Statcast metrics
+#
+
 SAVANT_BASE = "https://baseballsavant.mlb.com"
 SAVANT_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -97,52 +100,65 @@ SAVANT_HEADERS = {
 
 def fetch_savant_homers(game_pk: int) -> list[dict]:
     """
-    Query Baseball Savant's statcast_search CSV for all home runs in game_pk.
-    Returns a list of dicts with keys: player_id (int), player_name,
-    launch_speed, launch_angle, hit_distance_sc.
-    Returns [] on any error.
+    Fetch live Statcast data for all home runs in game_pk from the Savant
+    gamefeed endpoint (/gf?game_pk=...).
+
+    Returns a list of dicts with keys:
+        player_id (int), player_name (str),
+        launch_speed (float|None), launch_angle (float|None),
+        hit_distance_sc (float|None)
+
+    The gamefeed JSON has a top-level structure like:
+        { "team_home": [...pitches...], "team_away": [...pitches...] }
+    Each pitch entry for a batted ball has:
+        pitch["events"] == "home_run"
+        pitch["batter"]  → MLBAM player id
+        pitch["hit_speed"], pitch["hit_angle"], pitch["hit_distance"]
     """
-    import csv, io
-    params = {
-        "all":           "true",
-        "game_pk":       game_pk,
-        "type":          "details",
-        "player_type":   "batter",
-        "events":        "home_run",
-        "csv":           "true",
-    }
     try:
         r = requests.get(
-            f"{SAVANT_BASE}/statcast_search/csv",
-            params=params,
+            f"{SAVANT_BASE}/gf",
+            params={"game_pk": game_pk},
             headers=SAVANT_HEADERS,
             timeout=15,
         )
         r.raise_for_status()
-        text = r.text.strip()
-        if not text or text.startswith("Error") or "<html" in text.lower():
-            return []
-        reader = csv.DictReader(io.StringIO(text))
-        rows = []
-        for row in reader:
+        data = r.json()
+    except Exception as e:
+        print(f"[{ts()}]   [Savant/gf] fetch error: {e}")
+        return []
+
+    def _f(val):
+        try:
+            return float(val) if val not in (None, "", "null") else None
+        except (ValueError, TypeError):
+            return None
+
+    rows = []
+    # Savant /gf splits pitches by which team is batting:
+    # "team_home" = pitches faced by the home team's batters
+    for side_key in ("team_home", "team_away"):
+        for pitch in data.get(side_key, []):
+            if pitch.get("events") != "home_run":
+                continue
             try:
-                pid = int(row.get("batter", 0))
+                pid = int(pitch.get("batter", 0))
             except (ValueError, TypeError):
                 pid = 0
-            def _f(key):
-                v = row.get(key, "").strip()
-                return float(v) if v else None
+            ev   = _f(pitch.get("hit_speed"))
+            la   = _f(pitch.get("hit_angle"))
+            dist = _f(pitch.get("hit_distance"))
+            print(f"[{ts()}]   [Savant/gf] HR row: pid={pid} "
+                  f"name={pitch.get('batter_name','?')!r} "
+                  f"EV={ev} LA={la} Dist={dist}")
             rows.append({
-                "player_id":      pid,
-                "player_name":    row.get("player_name", "").strip(),
-                "launch_speed":   _f("launch_speed"),
-                "launch_angle":   _f("launch_angle"),
-                "hit_distance_sc": _f("hit_distance_sc"),
+                "player_id":       pid,
+                "player_name":     pitch.get("batter_name", ""),
+                "launch_speed":    ev,
+                "launch_angle":    la,
+                "hit_distance_sc": dist,
             })
-        return rows
-    except Exception as e:
-        print(f"[{ts()}]   [Savant] fetch error: {e}")
-        return []
+    return rows
 
 
 def load_font(bold=False, size=None):
