@@ -14,7 +14,7 @@ All receipts use the standard HeckNet 💀 HeckNet 💀 header.
 
 import time
 import requests
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageWin
 import win32ui
 
@@ -552,7 +552,6 @@ def _current_inning(live: dict) -> tuple[int, str]:
 
 def _scheduled_start_utc(game: dict):
     import re as _re3
-    from datetime import timezone
     iso = game.get("gameDate", "")
     if not iso:
         return None
@@ -563,8 +562,6 @@ def _scheduled_start_utc(game: dict):
 
 
 def monitor():
-    from datetime import timezone
-
     print(f"[{ts()}] HeckNet GameDay starting — monitoring Blue Jays (team {BLUE_JAYS_TEAM_ID})")
 
     while True:
