@@ -71,24 +71,34 @@ def get_live_feed(game_pk: int) -> dict:
     return get(f"{MLB_BASE_11}/game/{game_pk}/feed/live")
 
 
-def get_player_stats(player_id: int, group: str, season: int) -> dict:
+def get_player_stats(player_id: int, group: str, season: int,
+                     _debug_keys: bool = False) -> dict:
     """
     Fetch combined season + seasonAdvanced stats for a player.
-    Returns a merged dict so callers can read both basic and advanced fields.
+    Makes two separate calls (season, then seasonAdvanced) and merges results.
     group: 'hitting' or 'pitching'
+    Set _debug_keys=True to print all returned stat keys to console.
     """
-    data = get(f"{MLB_BASE}/people/{player_id}",
-               params={"hydrate": (f"stats(group={group},type=season,season={season}),"
-                                   f"stats(group={group},type=seasonAdvanced,season={season})")})
-    people = data.get("people", [])
-    if not people:
-        return {}
     merged = {}
-    for stat_block in people[0].get("stats", []):
-        if stat_block.get("group", {}).get("displayName", "").lower() == group:
-            splits = stat_block.get("splits", [])
-            if splits:
-                merged.update(splits[0].get("stat", {}))
+    for stat_type in ("season", "seasonAdvanced"):
+        try:
+            data = get(f"{MLB_BASE}/people/{player_id}",
+                       params={"hydrate": f"stats(group={group},type={stat_type},season={season})"})
+            people = data.get("people", [])
+            if not people:
+                continue
+            for stat_block in people[0].get("stats", []):
+                if stat_block.get("group", {}).get("displayName", "").lower() == group:
+                    splits = stat_block.get("splits", [])
+                    if splits:
+                        stat = splits[0].get("stat", {})
+                        if _debug_keys:
+                            print(f"[{ts()}]   [stats debug] pid={player_id} "
+                                  f"type={stat_type} group={group} "
+                                  f"keys={list(stat.keys())}")
+                        merged.update(stat)
+        except Exception as e:
+            print(f"[{ts()}]   [stats] pid={player_id} type={stat_type} error: {e}")
     return merged
 
 
@@ -533,9 +543,10 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         name     = info.get("boxscoreName") or info.get("fullName", f"#{pid}")
         pos_code = info.get("primaryPosition", {}).get("abbreviation", "")
         try:
-            stats = get_player_stats(pid, "hitting", season)
+            debug = (len(lineup) == 0)   # log keys only for the first batter
+            stats = get_player_stats(pid, "hitting", season, _debug_keys=debug)
             avg   = stats.get("avg",  ".---")
-            woba  = stats.get("wOBA", ".---")
+            woba  = stats.get("wOBA") or stats.get("woba") or ".---"
         except Exception:
             avg, woba = ".---", ".---"
         lineup.append({"name": name, "position": pos_code, "avg": avg, "woba": woba})
@@ -547,9 +558,9 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         info  = player_info(sp_id)
         name  = info.get("boxscoreName") or info.get("fullName", f"#{sp_id}")
         try:
-            stats = get_player_stats(sp_id, "pitching", season)
+            stats = get_player_stats(sp_id, "pitching", season, _debug_keys=True)
             era   = stats.get("era", "-.--")
-            fip   = stats.get("fip", "-.--")
+            fip   = stats.get("fip") or stats.get("fieldingIndependentPitching") or "-.--"
         except Exception:
             era, fip = "-.--", "-.--"
         jays_pitcher = {"name": name, "era": era, "fip": fip}
@@ -565,7 +576,7 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         try:
             stats = get_player_stats(op_id, "pitching", season)
             era   = stats.get("era", "-.--")
-            fip   = stats.get("fip", "-.--")
+            fip   = stats.get("fip") or stats.get("fieldingIndependentPitching") or "-.--"
         except Exception:
             era, fip = "-.--", "-.--"
         opp_pitcher = {"name": name, "era": era, "fip": fip}
