@@ -398,14 +398,14 @@ def build_play_ball(lineup: list[dict], pitcher: dict, opp_pitcher: dict,
 
     add("BATTING ORDER", bold=True)
     for i, batter in enumerate(lineup, 1):
-        pos  = batter.get("position", "  ")[:2].upper()
-        name = batter["name"]
-        avg  = batter.get("avg", ".---")
-        ops  = batter.get("ops", ".---")
+        pos      = batter.get("position", "  ")[:2].upper()
+        name     = batter["name"]
+        avg      = batter.get("avg", ".---")
+        batter_ops = batter.get("ops", ".---")
         line = f"{i}. {pos} {name}"
         for wl in word_wrap(line, font_n, text_w):
             add(wl)
-        add(f"   AVG {avg}  OPS {ops}", small=True)
+        add(f"   AVG {avg}  OPS {batter_ops}", small=True)
 
     div()
 
