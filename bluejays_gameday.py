@@ -72,18 +72,24 @@ def get_live_feed(game_pk: int) -> dict:
 
 
 def get_player_stats(player_id: int, group: str, season: int) -> dict:
-    """Fetch season stats for a player. group: 'hitting' or 'pitching'."""
+    """
+    Fetch combined season + seasonAdvanced stats for a player.
+    Returns a merged dict so callers can read both basic and advanced fields.
+    group: 'hitting' or 'pitching'
+    """
     data = get(f"{MLB_BASE}/people/{player_id}",
-               params={"hydrate": f"stats(group={group},type=season,season={season})"})
+               params={"hydrate": (f"stats(group={group},type=season,season={season}),"
+                                   f"stats(group={group},type=seasonAdvanced,season={season})")})
     people = data.get("people", [])
     if not people:
         return {}
+    merged = {}
     for stat_block in people[0].get("stats", []):
         if stat_block.get("group", {}).get("displayName", "").lower() == group:
             splits = stat_block.get("splits", [])
             if splits:
-                return splits[0].get("stat", {})
-    return {}
+                merged.update(splits[0].get("stat", {}))
+    return merged
 
 
 # Baseball Savant live gamefeed — home run Statcast metrics
@@ -322,11 +328,12 @@ def _render_with_skull_header(ops: list, header_line_idx: int) -> Image.Image:
     return output.crop((0, 0, out_w, int(y / S) + 4))
 
 
-def build_play_ball(lineup: list[dict], pitcher: dict,
+def build_play_ball(lineup: list[dict], pitcher: dict, opp_pitcher: dict,
                     opponent: str, game_time: str) -> Image.Image:
     """
-    lineup: [{"name": str, "avg": str, "position": str}, ...]  (batting order)
-    pitcher: {"name": str, "era": str}
+    lineup:      [{"name": str, "avg": str, "woba": str, "position": str}, ...]
+    pitcher:     {"name": str, "era": str, "fip": str}  (Jays SP)
+    opp_pitcher: {"name": str, "era": str, "fip": str}  (opponent SP)
     """
     font_n  = load_font(bold=False)
     font_b  = load_font(bold=True)
@@ -354,17 +361,22 @@ def build_play_ball(lineup: list[dict], pitcher: dict,
     for i, batter in enumerate(lineup, 1):
         pos  = batter.get("position", "  ")[:2].upper()
         name = batter["name"]
-        avg  = batter.get("avg", ".---")
+        avg  = batter.get("avg",  ".---")
+        woba = batter.get("woba", ".---")
         line = f"{i}. {pos} {name}"
         for wl in word_wrap(line, font_n, text_w):
             add(wl)
-        add(f"   AVG: {avg}", small=True)
+        add(f"   AVG {avg}  wOBA {woba}", small=True)
 
     div()
 
-    add("STARTING PITCHER", bold=True)
-    add(pitcher["name"])
-    add(f"ERA: {pitcher.get('era', '-.--')}", small=True)
+    add("PITCHING MATCHUP", bold=True)
+    add("TOR  " + pitcher["name"])
+    add(f"     ERA {pitcher.get('era','-.--')}  FIP {pitcher.get('fip','-.--')}",
+        small=True)
+    add(opponent[:3].upper() + "  " + opp_pitcher["name"])
+    add(f"     ERA {opp_pitcher.get('era','-.--')}  FIP {opp_pitcher.get('fip','-.--')}",
+        small=True)
     div()
 
     return _render_with_skull_header(ops, skull_idx)
@@ -415,17 +427,20 @@ def build_home_run(player_name: str, launch_angle, exit_velo, distance,
 
 
 def build_game_end(jays_win: bool, jays_score: int, opp_score: int,
-                   opp_name: str) -> Image.Image:
+                   opp_name: str, live: dict) -> Image.Image:
     font_n  = load_font(bold=False)
     font_b  = load_font(bold=True)
     font_sm = load_font(bold=False, size=FONT_SIZE - 6)
+    font_xs = load_font(bold=False, size=FONT_SIZE - 10)
     text_w  = TEXT_PX * RENDER_SCALE
     DIVIDER = "─" * int(text_w / (FONT_SIZE * RENDER_SCALE * 0.62))
 
     ops = []
 
-    def add(text, bold=False, align="left", small=False):
-        ops.append((text, font_sm if small else (font_b if bold else font_n), align))
+    def add(text, bold=False, align="left", small=False, xs=False):
+        ops.append((text,
+                    font_xs if xs else (font_sm if small else (font_b if bold else font_n)),
+                    align))
 
     def div():
         add(DIVIDER)
@@ -442,6 +457,39 @@ def build_game_end(jays_win: bool, jays_score: int, opp_score: int,
     add(f"TOR {jays_score}  –  {opp_score} {opp_name[:3].upper()}",
         align="center")
     div()
+
+    # Box score
+    # Layout: vertical innings — one inning per row so we fit on 80mm paper.
+    try:
+        linescore = live.get("liveData", {}).get("linescore", {})
+        innings   = linescore.get("innings", [])
+        ls_teams  = linescore.get("teams", {})
+        jays_sid  = _jays_side(live)
+        opp_sid   = "away" if jays_sid == "home" else "home"
+
+        jays_abbr = "TOR"
+        opp_abbr  = opp_name[:3].upper()
+
+        add(f"{'INN':^5} {jays_abbr:^5} {opp_abbr:^5}", bold=True)
+        for inn in innings:
+            num      = inn.get("num", "?")
+            jays_r   = inn.get(jays_sid, {}).get("runs", "-")
+            opp_r    = inn.get(opp_sid,  {}).get("runs", "-")
+            if jays_r is None: jays_r = "x"
+            if opp_r  is None: opp_r  = "x"
+            add(f"{str(num):^5} {str(jays_r):^5} {str(opp_r):^5}", small=True)
+
+        div()
+        def tot(side, key):
+            return str(ls_teams.get(side, {}).get(key, 0) or 0)
+
+        add(f"{'R':^5} {tot(jays_sid,'runs'):^5} {tot(opp_sid,'runs'):^5}", bold=True)
+        add(f"{'H':^5} {tot(jays_sid,'hits'):^5} {tot(opp_sid,'hits'):^5}", small=True)
+        add(f"{'E':^5} {tot(jays_sid,'errors'):^5} {tot(opp_sid,'errors'):^5}", small=True)
+        div()
+    except Exception as e:
+        add(f"(box score unavailable: {e})", small=True)
+        div()
 
     return _render_with_skull_header(ops, 0)
 
@@ -486,13 +534,14 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         pos_code = info.get("primaryPosition", {}).get("abbreviation", "")
         try:
             stats = get_player_stats(pid, "hitting", season)
-            avg   = stats.get("avg", ".---")
+            avg   = stats.get("avg",  ".---")
+            woba  = stats.get("wOBA", ".---")
         except Exception:
-            avg = ".---"
-        lineup.append({"name": name, "position": pos_code, "avg": avg})
+            avg, woba = ".---", ".---"
+        lineup.append({"name": name, "position": pos_code, "avg": avg, "woba": woba})
         time.sleep(0.1)   # gentle on the API
 
-    pitcher_data = {"name": "Unknown", "era": "-.--"}
+    jays_pitcher = {"name": "Unknown", "era": "-.--", "fip": "-.--"}
     if pitchers_list:
         sp_id = pitchers_list[0]
         info  = player_info(sp_id)
@@ -500,11 +549,28 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         try:
             stats = get_player_stats(sp_id, "pitching", season)
             era   = stats.get("era", "-.--")
+            fip   = stats.get("fip", "-.--")
         except Exception:
-            era = "-.--"
-        pitcher_data = {"name": name, "era": era}
+            era, fip = "-.--", "-.--"
+        jays_pitcher = {"name": name, "era": era, "fip": fip}
 
-    return lineup, pitcher_data
+    opp_side      = "away" if jays_side == "home" else "home"
+    opp_team_box  = box.get("teams", {}).get(opp_side, {})
+    opp_pitchers  = opp_team_box.get("pitchers", [])
+    opp_pitcher   = {"name": "Unknown", "era": "-.--", "fip": "-.--"}
+    if opp_pitchers:
+        op_id  = opp_pitchers[0]
+        info   = player_info(op_id)
+        name   = info.get("boxscoreName") or info.get("fullName", f"#{op_id}")
+        try:
+            stats = get_player_stats(op_id, "pitching", season)
+            era   = stats.get("era", "-.--")
+            fip   = stats.get("fip", "-.--")
+        except Exception:
+            era, fip = "-.--", "-.--"
+        opp_pitcher = {"name": name, "era": era, "fip": fip}
+
+    return lineup, jays_pitcher, opp_pitcher
 
 
 def _jays_side(live: dict) -> str:
@@ -675,7 +741,7 @@ def monitor():
                 label = f"Inn {inning} ({half})" if mid_game else "first pitch"
                 print(f"[{ts()}] Game is live ({label}) — building lineup receipt…")
                 try:
-                    lineup, pitcher = build_lineup_data(live)
+                    lineup, pitcher, opp_pitcher = build_lineup_data(live)
                     g_time = (live.get("gameData", {})
                                   .get("datetime", {})
                                   .get("time", ""))
@@ -683,7 +749,7 @@ def monitor():
                                   .get("datetime", {})
                                   .get("ampm", ""))
                     game_time_str = f"{g_time} {ampm} ET" if g_time else ""
-                    img = build_play_ball(lineup, pitcher, opp, game_time_str)
+                    img = build_play_ball(lineup, pitcher, opp_pitcher, opp, game_time_str)
                     send_to_printer(img)
                     printed_start = True
                     print(f"[{ts()}]  Play Ball receipt printed.")
@@ -809,7 +875,7 @@ def monitor():
                 print(f"[{ts()}] Game over — printing result receipt…")
                 try:
                     jays_win = jays_score > opp_score
-                    img = build_game_end(jays_win, jays_score, opp_score, opp)
+                    img = build_game_end(jays_win, jays_score, opp_score, opp, live)
                     send_to_printer(img)
                     printed_end = True
                     print(f"[{ts()}]  Game End receipt printed.")
