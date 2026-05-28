@@ -102,6 +102,42 @@ def get_player_stats(player_id: int, group: str, season: int,
     return merged
 
 
+# FIP constant — league ERA minus league FIP-without-constant.
+# 3.15 is a reasonable approximation for 2024-2026.
+FIP_CONSTANT = 3.15
+
+def _parse_ip(ip_str) -> float:
+    """Convert '5.2' (5 and 2/3 innings) → 5.667 float. MLB uses .1/.2 for thirds."""
+    try:
+        s = str(ip_str)
+        if '.' in s:
+            full, thirds = s.split('.', 1)
+            return int(full) + int(thirds) / 3.0
+        return float(s)
+    except Exception:
+        return 0.0
+
+
+def calc_fip(stats: dict) -> str:
+    """
+    Calculate FIP from a merged season pitching stat dict.
+    Formula: ((13*HR + 3*(BB+HBP) - 2*K) / IP) + FIP_CONSTANT
+    Returns formatted string e.g. '3.42', or '-.--' on error / no IP.
+    """
+    try:
+        hr  = int(stats.get("homeRuns",   0) or 0)
+        bb  = int(stats.get("baseOnBalls", 0) or 0)
+        hbp = int(stats.get("hitBatsmen", 0) or 0)   # pitching key is hitBatsmen
+        k   = int(stats.get("strikeOuts", 0) or 0)
+        ip  = _parse_ip(stats.get("inningsPitched", "0"))
+        if ip < 0.1:
+            return "-.--"
+        fip = ((13 * hr + 3 * (bb + hbp) - 2 * k) / ip) + FIP_CONSTANT
+        return f"{fip:.2f}"
+    except Exception:
+        return "-.--"
+
+
 # Baseball Savant live gamefeed — home run Statcast metrics
 #
 
@@ -371,12 +407,12 @@ def build_play_ball(lineup: list[dict], pitcher: dict, opp_pitcher: dict,
     for i, batter in enumerate(lineup, 1):
         pos  = batter.get("position", "  ")[:2].upper()
         name = batter["name"]
-        avg  = batter.get("avg",  ".---")
-        woba = batter.get("woba", ".---")
+        avg  = batter.get("avg", ".---")
+        ops  = batter.get("ops", ".---")
         line = f"{i}. {pos} {name}"
         for wl in word_wrap(line, font_n, text_w):
             add(wl)
-        add(f"   AVG {avg}  wOBA {woba}", small=True)
+        add(f"   AVG {avg}  OPS {ops}", small=True)
 
     div()
 
@@ -545,11 +581,11 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         try:
             debug = (len(lineup) == 0)   # log keys only for the first batter
             stats = get_player_stats(pid, "hitting", season, _debug_keys=debug)
-            avg   = stats.get("avg",  ".---")
-            woba  = stats.get("wOBA") or stats.get("woba") or ".---"
+            avg   = stats.get("avg", ".---") or ".---"
+            ops   = stats.get("ops", ".---") or ".---"
         except Exception:
-            avg, woba = ".---", ".---"
-        lineup.append({"name": name, "position": pos_code, "avg": avg, "woba": woba})
+            avg, ops = ".---", ".---"
+        lineup.append({"name": name, "position": pos_code, "avg": avg, "ops": ops})
         time.sleep(0.1)   # gentle on the API
 
     jays_pitcher = {"name": "Unknown", "era": "-.--", "fip": "-.--"}
@@ -559,8 +595,8 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         name  = info.get("boxscoreName") or info.get("fullName", f"#{sp_id}")
         try:
             stats = get_player_stats(sp_id, "pitching", season, _debug_keys=True)
-            era   = stats.get("era", "-.--")
-            fip   = stats.get("fip") or stats.get("fieldingIndependentPitching") or "-.--"
+            era   = stats.get("era", "-.--") or "-.--"
+            fip   = calc_fip(stats)
         except Exception:
             era, fip = "-.--", "-.--"
         jays_pitcher = {"name": name, "era": era, "fip": fip}
@@ -575,8 +611,8 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         name   = info.get("boxscoreName") or info.get("fullName", f"#{op_id}")
         try:
             stats = get_player_stats(op_id, "pitching", season)
-            era   = stats.get("era", "-.--")
-            fip   = stats.get("fip") or stats.get("fieldingIndependentPitching") or "-.--"
+            era   = stats.get("era", "-.--") or "-.--"
+            fip   = calc_fip(stats)
         except Exception:
             era, fip = "-.--", "-.--"
         opp_pitcher = {"name": name, "era": era, "fip": fip}
