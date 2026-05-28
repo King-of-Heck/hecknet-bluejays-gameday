@@ -71,13 +71,11 @@ def get_live_feed(game_pk: int) -> dict:
     return get(f"{MLB_BASE_11}/game/{game_pk}/feed/live")
 
 
-def get_player_stats(player_id: int, group: str, season: int,
-                     _debug_keys: bool = False) -> dict:
+def get_player_stats(player_id: int, group: str, season: int) -> dict:
     """
     Fetch combined season + seasonAdvanced stats for a player.
-    Makes two separate calls (season, then seasonAdvanced) and merges results.
+    Makes two separate calls and merges results.
     group: 'hitting' or 'pitching'
-    Set _debug_keys=True to print all returned stat keys to console.
     """
     merged = {}
     for stat_type in ("season", "seasonAdvanced"):
@@ -91,12 +89,7 @@ def get_player_stats(player_id: int, group: str, season: int,
                 if stat_block.get("group", {}).get("displayName", "").lower() == group:
                     splits = stat_block.get("splits", [])
                     if splits:
-                        stat = splits[0].get("stat", {})
-                        if _debug_keys:
-                            print(f"[{ts()}]   [stats debug] pid={player_id} "
-                                  f"type={stat_type} group={group} "
-                                  f"keys={list(stat.keys())}")
-                        merged.update(stat)
+                        merged.update(splits[0].get("stat", {}))
         except Exception as e:
             print(f"[{ts()}]   [stats] pid={player_id} type={stat_type} error: {e}")
     return merged
@@ -579,8 +572,7 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         name     = info.get("boxscoreName") or info.get("fullName", f"#{pid}")
         pos_code = info.get("primaryPosition", {}).get("abbreviation", "")
         try:
-            debug = (len(lineup) == 0)   # log keys only for the first batter
-            stats = get_player_stats(pid, "hitting", season, _debug_keys=debug)
+            stats = get_player_stats(pid, "hitting", season)
             avg   = stats.get("avg", ".---") or ".---"
             ops   = stats.get("ops", ".---") or ".---"
         except Exception:
@@ -594,7 +586,7 @@ def build_lineup_data(live: dict) -> tuple[list[dict], dict]:
         info  = player_info(sp_id)
         name  = info.get("boxscoreName") or info.get("fullName", f"#{sp_id}")
         try:
-            stats = get_player_stats(sp_id, "pitching", season, _debug_keys=True)
+            stats = get_player_stats(sp_id, "pitching", season)
             era   = stats.get("era", "-.--") or "-.--"
             fip   = calc_fip(stats)
         except Exception:
