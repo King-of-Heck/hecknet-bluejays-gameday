@@ -12,6 +12,9 @@ and prints thermal receipts for three events:
 All receipts use the standard HeckNet 💀 HeckNet 💀 header.
 """
 
+import sys
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 import time
 import requests
 from datetime import datetime, date, timedelta, timezone
