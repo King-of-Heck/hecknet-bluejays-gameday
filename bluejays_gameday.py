@@ -36,9 +36,12 @@ PAPER_PX    = int(PAPER_MM / 25.4 * PRINTER_DPI)   # ≈ 638 px
 MARGIN_PX   = 10
 TEXT_PX     = PAPER_PX - 2 * MARGIN_PX
 
-POLL_INTERVAL    = 15    # seconds between live-feed polls during a game
-IDLE_INTERVAL    = 60    # seconds between schedule checks when no game is live
-HR_STAT_TIMEOUT  = 600   # seconds to wait for Statcast hitData before printing anyway
+POLL_INTERVAL     = 15    # seconds between live-feed polls during a game
+IDLE_INTERVAL     = 60    # seconds between schedule checks when no game is live
+HR_STAT_TIMEOUT   = 600   # seconds to wait for Statcast hitData before printing anyway
+POST_GAME_BUFFER  = 300   # seconds to wait after a game ends before re-checking
+                          # the schedule (covers doubleheaders / late-night games
+                          # that roll into a day-game date)
 
 BLUE_JAYS_TEAM_ID = 141
 
@@ -58,16 +61,20 @@ def get(url: str, params: dict = None) -> dict:
     return r.json()
 
 
-def find_todays_jays_game() -> dict | None:
-    """Return the game dict for today's Blue Jays game, or None."""
+def find_todays_jays_games() -> list[dict]:
+    """
+    Return ALL of today's Blue Jays games, sorted by game number then start
+    time. Normally a list of one game; a doubleheader returns two.
+    """
     today = date.today().strftime("%Y-%m-%d")
     data  = get(f"{MLB_BASE}/schedule",
                 params={"sportId": 1, "teamId": BLUE_JAYS_TEAM_ID,
                         "date": today, "hydrate": "team,linescore"})
+    games = []
     for date_entry in data.get("dates", []):
-        for game in date_entry.get("games", []):
-            return game   # first (usually only) game today
-    return None
+        games.extend(date_entry.get("games", []))
+    games.sort(key=lambda g: (g.get("gameNumber", 1), g.get("gameDate", "")))
+    return games
 
 
 def get_live_feed(game_pk: int) -> dict:
@@ -672,33 +679,51 @@ def _scheduled_start_utc(game: dict):
 def monitor():
     print(f"[{ts()}] HeckNet GameDay starting — monitoring Blue Jays (team {BLUE_JAYS_TEAM_ID})")
 
+    # Game PKs we've fully handled (game ended, or was already Final when we
+    # found it). Reset whenever the calendar date rolls over, since gamePks
+    handled_pks: set[int] = set()
+    handled_date: str | None = None
+
     while True:
-        game = None
+        today_str = date.today().strftime("%Y-%m-%d")
+        if handled_date != today_str:
+            handled_pks.clear()
+            handled_date = today_str
+
+        games = []
         try:
-            game = find_todays_jays_game()
+            games = find_todays_jays_games()
         except Exception as e:
             print(f"[{ts()}] Schedule fetch error: {e}")
 
-        if not game:
+        remaining = [g for g in games if g["gamePk"] not in handled_pks]
+
+        if not remaining:
             now      = datetime.now()
             tomorrow = (now + timedelta(days=1)).replace(
                            hour=0, minute=5, second=0, microsecond=0)
             sleep_s  = max(60, (tomorrow - now).total_seconds())
-            print(f"[{ts()}] No Blue Jays game today. Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
+            if games:
+                print(f"[{ts()}] All {len(games)} Blue Jays game(s) today are "
+                      f"handled. Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
+            else:
+                print(f"[{ts()}] No Blue Jays game today. Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
             time.sleep(sleep_s)
             continue
 
-        game_pk = game["gamePk"]
-        state   = game.get("status", {}).get("abstractGameState", "")
-        print(f"[{ts()}] Game found: pk={game_pk}, state={state}")
+        game     = remaining[0]
+        game_pk  = game["gamePk"]
+        game_num = game.get("gameNumber", 1)
+        state    = game.get("status", {}).get("abstractGameState", "")
+        dh_note  = f" (game {game_num} of doubleheader)" if len(games) > 1 else ""
+        print(f"[{ts()}] Game found: pk={game_pk}, state={state}{dh_note}")
 
+        # Already over
+        # Shouldn't normally happen since we filter handled_pks, but can occur
         if state == "Final":
-            now      = datetime.now()
-            tomorrow = (now + timedelta(days=1)).replace(
-                           hour=0, minute=5, second=0, microsecond=0)
-            sleep_s  = max(60, (tomorrow - now).total_seconds())
-            print(f"[{ts()}] Game already final. Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
-            time.sleep(sleep_s)
+            handled_pks.add(game_pk)
+            print(f"[{ts()}] Game pk={game_pk} already final. Marking handled, "
+                  f"checking for more games today…")
             continue
 
         # Sleep until 10 minutes before first pitch
@@ -716,25 +741,21 @@ def monitor():
                     # Re-check the schedule before sleeping again; the game
                     # may have been postponed or its start time changed.
                     try:
-                        fresh = find_todays_jays_game()
+                        fresh_games = find_todays_jays_games()
                     except Exception as e:
                         print(f"[{ts()}] Schedule re-check error: {e}")
-                        fresh = game   # keep existing info on error
+                        fresh_games = games
+                    fresh = next((g for g in fresh_games if g["gamePk"] == game_pk), None)
                     if not fresh:
                         print(f"[{ts()}] Game no longer on today's schedule (postponed?). "
                               f"Returning to outer loop.")
                         game = None
                         break
-                    fresh_pk    = fresh["gamePk"]
                     fresh_state = fresh.get("status", {}).get("abstractGameState", "")
-                    if fresh_pk != game_pk:
-                        print(f"[{ts()}] Game PK changed ({game_pk}  {fresh_pk}). "
-                              f"Returning to outer loop.")
-                        game = None
-                        break
                     if fresh_state == "Final":
                         print(f"[{ts()}] Game marked Final before it started "
                               f"(likely postponed/cancelled). Returning to outer loop.")
+                        handled_pks.add(game_pk)
                         game = None
                         break
                     new_sched = _scheduled_start_utc(fresh)
@@ -925,6 +946,7 @@ def monitor():
                     print(f"[{ts()}]  Game End print error: {e}")
                     printed_end = True
 
+                handled_pks.add(game_pk)
                 print(f"[{ts()}] Game complete. Resuming idle watch.")
                 break   # exit inner loop; outer loop will find no game / sleep
 
@@ -934,12 +956,11 @@ def monitor():
                 print(f"[{ts()}] Still pre-game — checking in {POLL_INTERVAL}s…")
             time.sleep(POLL_INTERVAL)
 
-        now      = datetime.now()
-        tomorrow = (now + timedelta(days=1)).replace(
-                       hour=0, minute=5, second=0, microsecond=0)
-        sleep_s  = max(60, (tomorrow - now).total_seconds())
-        print(f"[{ts()}] Sleeping until tomorrow ({sleep_s/3600:.1f}h)…")
-        time.sleep(sleep_s)
+        # Game just ended. Don't assume the next check is "tomorrow" — a game
+        # that runs past midnight, or a doubleheader's first game, can leave a
+        print(f"[{ts()}] Re-checking schedule in {POST_GAME_BUFFER}s "
+              f"in case another game is on today…")
+        time.sleep(POST_GAME_BUFFER)
 
 
 if __name__ == "__main__":
