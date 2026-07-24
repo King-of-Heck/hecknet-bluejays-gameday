@@ -1,15 +1,15 @@
 """
-BlueJays_GameDay_1_4.py
-Monitors live Toronto Blue Jays games via the MLB Stats API (GUMBO feed)
-and prints thermal receipts for three events:
+Blue Jays game day receipts.
 
-  1. GAME START  — "PLAY BALL!" + Blue Jays batting lineup with AVG,
-                   and starting pitcher with ERA.
-  2. HOME RUN    — "HOME RUN BLUE JAYS!" + player name, launch angle,
-                   exit velocity, distance, current score.
-  3. GAME END    — "JAYS WIN!" or "JAYS LOSE :(" depending on result.
+Watches a live game through the MLB Stats API and prints three kinds of
+receipt: the starting lineup at first pitch, a home run receipt with the
+Statcast numbers, and the final score. Doubleheaders are handled - once game
+one finishes the script picks up game two from the same day's schedule.
 
-All receipts use the standard HeckNet 💀 HeckNet 💀 header.
+Between games it sleeps in hourly chunks, re-checking the schedule on each
+wake so postponements and start-time changes are caught.
+
+    python bluejays_gameday.py
 """
 
 import sys
